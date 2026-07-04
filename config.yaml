@@ -1,0 +1,57 @@
+data:
+  path: data/clients.csv
+  entity_column: customer.id
+  label_column: null  # set for downstream evaluation, e.g. churn
+
+features:
+  categorical:
+    oh_f_Payment_type: 7
+    oh_f_Payment_currency: 13
+    oh_f_Received_currency: 13
+    oh_f_Sender_bank_location: 18
+    oh_f_Receiver_bank_location: 18
+    t_f_datetime_month: 12
+    t_f_datetime_day: 31
+    t_f_datetime_hour: 24
+    t_f_datetime_minute: 60
+    t_f_weekday: 7
+  numeric_columns:
+    - c_f_Amount
+    - c_f_timestamp_diff
+    - oh_f_same_currency
+    - oh_f_same_location
+  numeric_mappings:
+    c_f_Amount: Amount
+    c_f_timestamp_diff: Time_Gap
+  time_gap_source: timestamp_diff
+  time_features_zero_indexed:
+    - t_f_datetime_day
+    - t_f_datetime_hour
+    - t_f_datetime_minute
+    - t_f_weekday
+
+model:
+  hidden_dim: 512
+  output_dim: 512
+  feature_embed_dim: 16
+  pr_weight: 0.001      # alpha in the paper
+  decay_length: 5184000 # 60 days in seconds (lambda = ~2 months)
+  gru_num_layers: 1
+  k_past: 10
+
+training:
+  batch_size: 32
+  learning_rate: 0.001
+  num_epochs: 10
+  patience: 5
+  grad_clip: 0.5
+  train_frac: 0.8
+  seed: 42
+  checkpoint_path: checkpoints/best_model.pt
+
+evaluation:
+  downstream_hidden_dim: 512
+  downstream_num_layers: 3
+  downstream_epochs: 20
+  downstream_lr: 0.001
+  embedding_pool: mean
