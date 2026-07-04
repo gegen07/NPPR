@@ -1,15 +1,16 @@
 data:
   path: data/clients.csv
   entity_column: customer.id
+  transaction_id_column: transaction.id
   label_column: null  # set for downstream evaluation, e.g. churn
 
 features:
   categorical:
     oh_f_Payment_type: 7
-    oh_f_Payment_currency: 13
-    oh_f_Received_currency: 13
-    oh_f_Sender_bank_location: 18
-    oh_f_Receiver_bank_location: 18
+    oh_f_Payment_currency: 11
+    oh_f_Received_currency: 12
+    oh_f_Sender_bank_location: 14
+    oh_f_Receiver_bank_location: 17
     t_f_datetime_month: 12
     t_f_datetime_day: 31
     t_f_datetime_hour: 24
@@ -20,15 +21,10 @@ features:
     - c_f_timestamp_diff
     - oh_f_same_currency
     - oh_f_same_location
-  numeric_mappings:
-    c_f_Amount: Amount
-    c_f_timestamp_diff: Time_Gap
+  numeric_mappings: {}
   time_gap_source: timestamp_diff
-  time_features_zero_indexed:
-    - t_f_datetime_day
-    - t_f_datetime_hour
-    - t_f_datetime_minute
-    - t_f_weekday
+  time_features_zero_indexed: []
+  preprocessed: true
 
 model:
   hidden_dim: 512

@@ -54,6 +54,41 @@ def extract_entity_embeddings(model, dataloader, device, pool: str):
     return torch.cat(embeddings, dim=0), torch.cat(entity_lengths, dim=0)
 
 
+@torch.no_grad()
+def extract_transaction_embeddings(
+    model,
+    dataloader,
+    sequences,
+    device,
+    entity_column: str,
+    transaction_id_column: str,
+):
+    model.eval()
+    embeddings = []
+    transaction_ids = []
+    customer_ids = []
+
+    seq_idx = 0
+    for batch in dataloader:
+        cat_inputs, num_inputs, _, lengths = batch
+        cat_inputs = {feat: t.to(device) for feat, t in cat_inputs.items()}
+        num_inputs = num_inputs.to(device)
+        lengths = lengths.to(device)
+
+        step_embeddings = model.embed(cat_inputs, num_inputs, pool=None, lengths=lengths).cpu()
+        lengths = lengths.cpu()
+
+        for i in range(step_embeddings.size(0)):
+            seq = sequences[seq_idx]
+            seq_len = int(lengths[i])
+            embeddings.append(step_embeddings[i, :seq_len])
+            transaction_ids.extend(seq[transaction_id_column].iloc[:seq_len].tolist())
+            customer_ids.extend(seq[entity_column].iloc[:seq_len].tolist())
+            seq_idx += 1
+
+    return torch.cat(embeddings, dim=0), transaction_ids, customer_ids
+
+
 def entity_labels_from_sequences(sequences, entity_column: str, label_column: str):
     labels = []
     for seq in sequences:
@@ -142,9 +177,10 @@ def main(config_path: str, checkpoint_path: str | None):
 
     preprocessor = TransactionPreprocessor(
         categorical_features=categorical_features,
-        numeric_mappings=feat_cfg["numeric_mappings"],
+        numeric_mappings=feat_cfg.get("numeric_mappings"),
         time_gap_source=feat_cfg["time_gap_source"],
         time_features_zero_indexed=feat_cfg.get("time_features_zero_indexed", []),
+        preprocessed=feat_cfg.get("preprocessed", False),
     )
     train_df = preprocessor.fit_transform(df[df[entity_col].isin(train_entities)])
     test_df = preprocessor.transform(df[df[entity_col].isin(test_entities)])

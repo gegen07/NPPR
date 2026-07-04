@@ -7,6 +7,7 @@ import pandas as pd
 import torch
 import yaml
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from dataset import TransactionDataset, build_sequence_groups, collate_fn
 from model import NPPRModel
@@ -37,14 +38,15 @@ def move_batch_to_device(batch, device):
     )
 
 
-def run_epoch(model, dataloader, device, optimizer=None, grad_clip=0.5):
+def run_epoch(model, dataloader, device, optimizer=None, grad_clip=0.5, desc=None):
     is_train = optimizer is not None
     model.train(is_train)
 
     total_loss = 0.0
     n_batches = 0
 
-    for batch in dataloader:
+    batch_iter = tqdm(dataloader, desc=desc, leave=False) if desc else dataloader
+    for batch in batch_iter:
         cat_inputs, num_inputs, delta_matrix, lengths = move_batch_to_device(batch, device)
 
         outputs = model(cat_inputs, num_inputs, delta_matrix)
@@ -58,6 +60,8 @@ def run_epoch(model, dataloader, device, optimizer=None, grad_clip=0.5):
 
         total_loss += loss.item()
         n_batches += 1
+        if desc:
+            batch_iter.set_postfix(loss=f"{loss.item():.4f}")
 
     return total_loss / max(n_batches, 1)
 
@@ -82,9 +86,10 @@ def main(config_path: str):
 
     preprocessor = TransactionPreprocessor(
         categorical_features=categorical_features,
-        numeric_mappings=feat_cfg["numeric_mappings"],
+        numeric_mappings=feat_cfg.get("numeric_mappings"),
         time_gap_source=feat_cfg["time_gap_source"],
         time_features_zero_indexed=feat_cfg.get("time_features_zero_indexed", []),
+        preprocessed=feat_cfg.get("preprocessed", False),
     )
 
     entity_ids = df[entity_col].unique()
@@ -143,16 +148,24 @@ def main(config_path: str):
     best_val_loss = float("inf")
     epochs_without_improvement = 0
 
-    for epoch in range(train_cfg["num_epochs"]):
+    epoch_bar = tqdm(range(train_cfg["num_epochs"]), desc="Training")
+    for epoch in epoch_bar:
         train_loss = run_epoch(
-            model, train_loader, device, optimizer, grad_clip=train_cfg["grad_clip"]
+            model,
+            train_loader,
+            device,
+            optimizer,
+            grad_clip=train_cfg["grad_clip"],
+            desc=f"Epoch {epoch + 1} train",
         )
-        val_loss = run_epoch(model, val_loader, device)
+        val_loss = run_epoch(
+            model,
+            val_loader,
+            device,
+            desc=f"Epoch {epoch + 1} val",
+        )
 
-        print(
-            f"Epoch {epoch + 1}/{train_cfg['num_epochs']} "
-            f"— train loss: {train_loss:.4f}, val loss: {val_loss:.4f}"
-        )
+        epoch_bar.set_postfix(train=f"{train_loss:.4f}", val=f"{val_loss:.4f}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
