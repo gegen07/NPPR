@@ -20,20 +20,31 @@ def compute_accumulated_gaps(time_gaps, k_past: int) -> np.ndarray:
     return delta_matrix
 
 
-def _sequence_to_tensors(seq, categorical_columns, numeric_columns, time_gap_column, k_past):
-    cat_inputs = {
-        col: torch.tensor(seq[col].values, dtype=torch.long)
-        for col in categorical_columns
+def _sequence_to_arrays(
+    seq,
+    categorical_columns,
+    numeric_columns,
+    time_gap_column,
+    transaction_id_column=None,
+    entity_column=None,
+):
+    """Store each customer sequence as compact numpy arrays (no torch duplication)."""
+    sample = {
+        "cat": {
+            col: np.ascontiguousarray(seq[col].to_numpy(), dtype=np.int64)
+            for col in categorical_columns
+        },
+        "num": np.ascontiguousarray(seq[numeric_columns].to_numpy(), dtype=np.float32),
+        "gaps": np.ascontiguousarray(seq[time_gap_column].to_numpy(), dtype=np.float32),
     }
-    num_inputs = torch.tensor(
-        seq[numeric_columns].values,
-        dtype=torch.float,
-    )
-    delta_matrix = torch.tensor(
-        compute_accumulated_gaps(seq[time_gap_column].values, k_past),
-        dtype=torch.float,
-    )
-    return cat_inputs, num_inputs, delta_matrix, len(seq)
+    if transaction_id_column and transaction_id_column in seq.columns:
+        sample["transaction_ids"] = np.ascontiguousarray(
+            seq[transaction_id_column].to_numpy(),
+            dtype=np.int64,
+        )
+    if entity_column and entity_column in seq.columns:
+        sample["customer_id"] = seq[entity_column].iloc[0]
+    return sample
 
 
 class TransactionDataset(Dataset):
@@ -44,28 +55,48 @@ class TransactionDataset(Dataset):
         numeric_columns: list[str],
         time_gap_column: str = "Time_Gap",
         k_past: int = 10,
+        transaction_id_column: str | None = None,
+        entity_column: str | None = None,
+        include_delta: bool = True,
     ):
-        self.sequences = list(sequences)
         self.categorical_columns = categorical_columns
-        self.numeric_columns = numeric_columns
-        self.time_gap_column = time_gap_column
         self.k_past = k_past
-        self.items = [
-            _sequence_to_tensors(
+        self.include_delta = include_delta
+        self.samples = [
+            _sequence_to_arrays(
                 seq,
                 categorical_columns,
                 numeric_columns,
                 time_gap_column,
-                k_past,
+                transaction_id_column=transaction_id_column,
+                entity_column=entity_column,
             )
-            for seq in self.sequences
+            for seq in sequences
         ]
 
     def __len__(self):
-        return len(self.items)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.items[idx]
+        sample = self.samples[idx]
+        cat_inputs = {
+            col: torch.from_numpy(sample["cat"][col])
+            for col in self.categorical_columns
+        }
+        num_inputs = torch.from_numpy(sample["num"])
+        seq_len = sample["num"].shape[0]
+
+        if not self.include_delta:
+            return cat_inputs, num_inputs, seq_len
+
+        delta_matrix = torch.from_numpy(
+            compute_accumulated_gaps(sample["gaps"], self.k_past)
+        )
+        return cat_inputs, num_inputs, delta_matrix, seq_len
+
+    @property
+    def total_transactions(self) -> int:
+        return sum(sample["num"].shape[0] for sample in self.samples)
 
 
 def collate_fn(batch):
@@ -83,6 +114,20 @@ def collate_fn(batch):
     padded_delta_matrix = pad_sequence(delta_matrix_batch, batch_first=True, padding_value=0.0)
 
     return padded_cat_inputs, padded_num_inputs, padded_delta_matrix, lengths
+
+
+def collate_fn_embed(batch):
+    cat_inputs_batch = [item[0] for item in batch]
+    num_inputs_batch = [item[1] for item in batch]
+    lengths = torch.tensor([item[2] for item in batch], dtype=torch.long)
+
+    padded_cat_inputs = {}
+    for key in cat_inputs_batch[0].keys():
+        sequences = [item[key] for item in cat_inputs_batch]
+        padded_cat_inputs[key] = pad_sequence(sequences, batch_first=True, padding_value=0)
+
+    padded_num_inputs = pad_sequence(num_inputs_batch, batch_first=True, padding_value=0.0)
+    return padded_cat_inputs, padded_num_inputs, lengths
 
 
 def build_sequence_groups(df, entity_column: str):

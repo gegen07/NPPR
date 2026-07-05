@@ -1,4 +1,5 @@
 import argparse
+import gc
 import random
 from pathlib import Path
 
@@ -138,6 +139,8 @@ def main(config_path: str):
     val_dataset = TransactionDataset(
         val_sequences, cat_cols, num_cols, k_past=k_past
     )
+    del df, train_df, val_df, train_sequences, val_sequences
+    gc.collect()
 
     train_loader = build_dataloader(
         train_dataset,

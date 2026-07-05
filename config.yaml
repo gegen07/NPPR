@@ -1,5 +1,6 @@
 data:
   path: data/clients.csv
+  emb_path: data/emb.csv
   entity_column: customer.id
   transaction_id_column: transaction.id
   label_column: null  # set for downstream evaluation, e.g. churn
@@ -43,9 +44,9 @@ training:
   grad_clip: 0.5
   train_frac: 0.8
   seed: 42
-  num_workers: 4
+  num_workers: 2
   pin_memory: true
-  prefetch_factor: 2
+  prefetch_factor: 1
   use_amp: false
   checkpoint_path: checkpoints/best_model.pt
 
@@ -55,3 +56,7 @@ evaluation:
   downstream_epochs: 20
   downstream_lr: 0.001
   embedding_pool: mean
+
+extraction:
+  batch_size: 1          # one customer per batch avoids padding blow-up on GPU
+  entity_batch_size: 64
