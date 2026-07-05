@@ -36,13 +36,17 @@ model:
   k_past: 10
 
 training:
-  batch_size: 32
+  batch_size: 128
   learning_rate: 0.001
   num_epochs: 10
   patience: 5
   grad_clip: 0.5
   train_frac: 0.8
   seed: 42
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+  use_amp: false
   checkpoint_path: checkpoints/best_model.pt
 
 evaluation:

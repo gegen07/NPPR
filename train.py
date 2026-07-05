@@ -29,39 +29,63 @@ def load_config(path: str) -> dict:
 
 def move_batch_to_device(batch, device):
     cat_inputs, num_inputs, delta_matrix, lengths = batch
-    cat_inputs = {feat: t.to(device) for feat, t in cat_inputs.items()}
+    non_blocking = device.type == "cuda"
+    cat_inputs = {
+        feat: tensor.to(device, non_blocking=non_blocking)
+        for feat, tensor in cat_inputs.items()
+    }
     return (
         cat_inputs,
-        num_inputs.to(device),
-        delta_matrix.to(device),
-        lengths.to(device),
+        num_inputs.to(device, non_blocking=non_blocking),
+        delta_matrix.to(device, non_blocking=non_blocking),
+        lengths.to(device, non_blocking=non_blocking),
     )
 
 
-def run_epoch(model, dataloader, device, optimizer=None, grad_clip=0.5, desc=None):
+def build_dataloader(dataset, batch_size, shuffle, num_workers, pin_memory, prefetch_factor):
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "collate_fn": collate_fn,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory and torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(dataset, **loader_kwargs)
+
+
+def run_epoch(model, dataloader, device, optimizer=None, grad_clip=0.5, use_amp=False, scaler=None):
     is_train = optimizer is not None
     model.train(is_train)
 
     total_loss = 0.0
     n_batches = 0
+    amp_enabled = use_amp and device.type == "cuda"
 
-    batch_iter = tqdm(dataloader, desc=desc, leave=False) if desc else dataloader
-    for batch in batch_iter:
+    for batch in dataloader:
         cat_inputs, num_inputs, delta_matrix, lengths = move_batch_to_device(batch, device)
 
-        outputs = model(cat_inputs, num_inputs, delta_matrix)
-        loss = model.loss(outputs, cat_inputs, num_inputs, delta_matrix, lengths)
+        with torch.autocast(device_type=device.type, enabled=amp_enabled):
+            outputs = model(cat_inputs, num_inputs, delta_matrix)
+            loss = model.loss(outputs, cat_inputs, num_inputs, delta_matrix, lengths)
 
         if is_train:
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if amp_enabled:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                optimizer.step()
 
         total_loss += loss.item()
         n_batches += 1
-        if desc:
-            batch_iter.set_postfix(loss=f"{loss.item():.4f}")
 
     return total_loss / max(n_batches, 1)
 
@@ -115,20 +139,30 @@ def main(config_path: str):
         val_sequences, cat_cols, num_cols, k_past=k_past
     )
 
-    train_loader = DataLoader(
+    train_loader = build_dataloader(
         train_dataset,
         batch_size=train_cfg["batch_size"],
         shuffle=True,
-        collate_fn=collate_fn,
+        num_workers=train_cfg.get("num_workers", 0),
+        pin_memory=train_cfg.get("pin_memory", True),
+        prefetch_factor=train_cfg.get("prefetch_factor", 2),
     )
-    val_loader = DataLoader(
+    val_loader = build_dataloader(
         val_dataset,
         batch_size=train_cfg["batch_size"],
         shuffle=False,
-        collate_fn=collate_fn,
+        num_workers=train_cfg.get("num_workers", 0),
+        pin_memory=train_cfg.get("pin_memory", True),
+        prefetch_factor=train_cfg.get("prefetch_factor", 2),
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = train_cfg.get("use_amp", False)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        tqdm.write(f"Using GPU: {torch.cuda.get_device_name(device)}")
+    else:
+        use_amp = False
     model = NPPRModel(
         hidden_dim=model_cfg["hidden_dim"],
         output_dim=model_cfg["output_dim"],
@@ -141,6 +175,7 @@ def main(config_path: str):
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=train_cfg["learning_rate"])
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     checkpoint_path = Path(train_cfg["checkpoint_path"])
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,7 +183,7 @@ def main(config_path: str):
     best_val_loss = float("inf")
     epochs_without_improvement = 0
 
-    epoch_bar = tqdm(range(train_cfg["num_epochs"]), desc="Training")
+    epoch_bar = tqdm(range(train_cfg["num_epochs"]), desc="Training", unit="epoch")
     for epoch in epoch_bar:
         train_loss = run_epoch(
             model,
@@ -156,16 +191,22 @@ def main(config_path: str):
             device,
             optimizer,
             grad_clip=train_cfg["grad_clip"],
-            desc=f"Epoch {epoch + 1} train",
+            use_amp=use_amp,
+            scaler=scaler,
         )
         val_loss = run_epoch(
             model,
             val_loader,
             device,
-            desc=f"Epoch {epoch + 1} val",
+            use_amp=use_amp,
         )
 
-        epoch_bar.set_postfix(train=f"{train_loss:.4f}", val=f"{val_loss:.4f}")
+        epoch_bar.set_postfix(
+            epoch=epoch + 1,
+            train=f"{train_loss:.4f}",
+            val=f"{val_loss:.4f}",
+            refresh=False,
+        )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -179,14 +220,14 @@ def main(config_path: str):
                 },
                 checkpoint_path,
             )
-            print(f"  Saved checkpoint to {checkpoint_path}")
+            tqdm.write(f"Saved checkpoint to {checkpoint_path}")
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= train_cfg["patience"]:
-                print(f"Early stopping at epoch {epoch + 1}")
+                tqdm.write(f"Early stopping at epoch {epoch + 1}")
                 break
 
-    print(f"Training complete. Best validation loss: {best_val_loss:.4f}")
+    tqdm.write(f"Training complete. Best validation loss: {best_val_loss:.4f}")
 
 
 if __name__ == "__main__":
