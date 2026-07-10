@@ -6,13 +6,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import yaml
-from sklearn.metrics import accuracy_score, roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader, TensorDataset
-
-from dataset import TransactionDataset, build_sequence_groups, collate_fn
-from model import NPPRModel
-from preprocess import TransactionPreprocessor
 
 
 def load_config(path: str) -> dict:
@@ -35,123 +30,63 @@ class DownstreamMLP(nn.Module):
         return self.net(x)
 
 
-@torch.inference_mode()
-def extract_entity_embeddings(model, dataloader, device, pool: str):
-    model.eval()
-    embeddings = []
-    entity_lengths = []
-
-    for batch in dataloader:
-        cat_inputs, num_inputs, lengths = batch
-        cat_inputs = {feat: t.to(device, non_blocking=True) for feat, t in cat_inputs.items()}
-        num_inputs = num_inputs.to(device, non_blocking=True)
-        lengths = lengths.to(device, non_blocking=True)
-
-        emb = model.embed(cat_inputs, num_inputs, pool=pool, lengths=lengths)
-        embeddings.append(emb.cpu())
-        entity_lengths.append(lengths.cpu())
-        del cat_inputs, num_inputs, emb
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-    return torch.cat(embeddings, dim=0), torch.cat(entity_lengths, dim=0)
-
-
-@torch.inference_mode()
-def extract_transaction_embeddings_to_dataframe(
-    model,
-    dataloader,
-    dataset,
-    device,
-    output_path: Path,
-    embed_dim: int,
-    transaction_id_column: str,
+def load_embeddings_parquet(
+    parquet_path: Path,
+    label_column: str,
+    split_column: str,
     entity_column: str,
+    level: str,
+) -> tuple[pd.DataFrame, list[str]]:
+    df = pd.read_parquet(parquet_path)
+    embed_cols = [c for c in df.columns if c.startswith("emb_")]
+    if not embed_cols:
+        raise ValueError(f"No emb_* columns found in {parquet_path}")
+
+    required = {label_column, split_column}
+    if level == "entity":
+        required.add(entity_column)
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns in parquet: {sorted(missing)}")
+
+    if level == "entity":
+        df = (
+            df.groupby(entity_column, as_index=False)
+            .agg(
+                **{
+                    label_column: (label_column, "first"),
+                    split_column: (split_column, "first"),
+                    **{col: (col, "mean") for col in embed_cols},
+                }
+            )
+        )
+
+    return df, embed_cols
+
+
+def split_embeddings_df(
+    df: pd.DataFrame,
+    embed_cols: list[str],
+    label_column: str,
+    split_column: str,
+    train_splits: list[str],
+    test_splits: list[str],
+    val_splits: list[str] | None = None,
 ):
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+    train_mask = df[split_column].isin(train_splits)
+    test_mask = df[split_column].isin(test_splits)
+    val_mask = df[split_column].isin(val_splits) if val_splits else pd.Series(False, index=df.index)
 
-    model.eval()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    embed_columns = [f"emb_{i}" for i in range(embed_dim)]
-    writer = None
-    total_rows = 0
-    seq_idx = 0
-
-    for batch in dataloader:
-        cat_inputs, num_inputs, lengths = batch
-        cat_inputs = {feat: t.to(device, non_blocking=True) for feat, t in cat_inputs.items()}
-        num_inputs = num_inputs.to(device, non_blocking=True)
-        lengths = lengths.to(device, non_blocking=True)
-
-        step_embeddings = model.embed(
-            cat_inputs, num_inputs, pool=None, lengths=lengths
-        ).float().cpu().numpy()
-        lengths = lengths.cpu().numpy()
-
-        for i in range(step_embeddings.shape[0]):
-            sample = dataset.samples[seq_idx]
-            seq_len = int(lengths[i])
-            chunk_df = pd.DataFrame(
-                step_embeddings[i, :seq_len],
-                columns=embed_columns,
-            )
-            chunk_df.insert(0, entity_column, sample["customer_id"])
-            chunk_df.insert(0, transaction_id_column, sample["transaction_ids"][:seq_len])
-
-            table = pa.Table.from_pandas(chunk_df, preserve_index=False)
-            if writer is None:
-                writer = pq.ParquetWriter(output_path, table.schema)
-            writer.write_table(table)
-            total_rows += seq_len
-            seq_idx += 1
-
-        del cat_inputs, num_inputs, step_embeddings, lengths
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-    if writer is not None:
-        writer.close()
-
-    return {
-        "total_transactions": total_rows,
-        "embed_dim": embed_dim,
-        "output_path": str(output_path),
-        "transaction_id_column": transaction_id_column,
-        "entity_column": entity_column,
-        "embedding_columns": embed_columns,
+    splits = {
+        "train": (df.loc[train_mask, embed_cols].values, df.loc[train_mask, label_column].values),
+        "test": (df.loc[test_mask, embed_cols].values, df.loc[test_mask, label_column].values),
     }
-
-
-def entity_embeddings_to_dataframe(
-    embeddings,
-    entity_ids,
-    entity_column: str,
-    embed_dim: int,
-    lengths=None,
-    pool: str | None = None,
-) -> pd.DataFrame:
-    embed_columns = [f"emb_{i}" for i in range(embed_dim)]
-    df = pd.DataFrame(embeddings.numpy(), columns=embed_columns)
-    df.insert(0, entity_column, entity_ids)
-    if lengths is not None:
-        df["sequence_length"] = lengths.numpy()
-    if pool is not None:
-        df["pool"] = pool
-    return df
-
-
-def entity_labels_from_sequences(sequences, entity_column: str, label_column: str):
-    labels = []
-    for seq in sequences:
-        label_values = seq[label_column].dropna().unique()
-        if len(label_values) != 1:
-            raise ValueError(
-                f"Entity {seq[entity_column].iloc[0]} has inconsistent labels: {label_values}"
-            )
-        labels.append(label_values[0])
-    return np.array(labels)
+    if val_splits:
+        splits["val"] = (
+            df.loc[val_mask, embed_cols].values,
+            df.loc[val_mask, label_column].values,
+        )
+    return splits
 
 
 def train_downstream_classifier(X_train, y_train, X_test, y_test, eval_cfg, device):
@@ -169,7 +104,7 @@ def train_downstream_classifier(X_train, y_train, X_test, y_test, eval_cfg, devi
     y_train_t = torch.tensor(y_train, dtype=torch.long)
     train_loader = DataLoader(
         TensorDataset(X_train_t, y_train_t),
-        batch_size=256,
+        batch_size=eval_cfg.get("downstream_batch_size", 256),
         shuffle=True,
     )
 
@@ -194,15 +129,14 @@ def train_downstream_classifier(X_train, y_train, X_test, y_test, eval_cfg, devi
     metrics = {"accuracy": accuracy_score(y_test, preds)}
     if num_classes == 2:
         metrics["auc"] = roc_auc_score(y_test, probs[:, 1])
+        metrics["ap"] = average_precision_score(y_test, probs[:, 1])
+        metrics["gini"] = 2 * metrics["auc"] - 1
     return metrics
 
 
-def main(config_path: str, checkpoint_path: str | None):
+def main(config_path: str, embeddings_path: str | None):
     config = load_config(config_path)
     data_cfg = config["data"]
-    feat_cfg = config["features"]
-    model_cfg = config["model"]
-    train_cfg = config["training"]
     eval_cfg = config["evaluation"]
 
     label_column = data_cfg.get("label_column")
@@ -211,91 +145,74 @@ def main(config_path: str, checkpoint_path: str | None):
         print("Set data.label_column in config.yaml to enable evaluation.")
         return
 
-    checkpoint = Path(checkpoint_path or train_cfg["checkpoint_path"])
-    if not checkpoint.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    parquet_path = Path(
+        embeddings_path
+        or eval_cfg.get("embeddings_path")
+        or data_cfg.get("embeddings_path")
+    )
+    if not parquet_path.exists():
+        raise FileNotFoundError(f"Embeddings parquet not found: {parquet_path}")
+
+    entity_col = data_cfg["entity_column"]
+    split_column = eval_cfg.get("split_column", "split")
+    train_splits = eval_cfg.get("train_splits", ["train", "val"])
+    test_splits = eval_cfg.get("test_splits", ["test"])
+    val_splits = eval_cfg.get("val_splits")
+    level = eval_cfg.get("level", "transaction")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    df = pd.read_csv(data_cfg["path"])
-    entity_col = data_cfg["entity_column"]
-    categorical_features = feat_cfg["categorical"]
-
-    entity_ids = df[entity_col].unique()
-    train_entities, test_entities = train_test_split(
-        entity_ids,
-        test_size=1 - train_cfg["train_frac"],
-        random_state=train_cfg["seed"],
+    df, embed_cols = load_embeddings_parquet(
+        parquet_path,
+        label_column=label_column,
+        split_column=split_column,
+        entity_column=entity_col,
+        level=level,
+    )
+    splits = split_embeddings_df(
+        df,
+        embed_cols,
+        label_column,
+        split_column,
+        train_splits,
+        test_splits,
+        val_splits,
     )
 
-    preprocessor = TransactionPreprocessor(
-        categorical_features=categorical_features,
-        numeric_mappings=feat_cfg.get("numeric_mappings"),
-        time_gap_source=feat_cfg["time_gap_source"],
-        time_features_zero_indexed=feat_cfg.get("time_features_zero_indexed", []),
-        preprocessed=feat_cfg.get("preprocessed", False),
-    )
-    train_df = preprocessor.fit_transform(df[df[entity_col].isin(train_entities)])
-    test_df = preprocessor.transform(df[df[entity_col].isin(test_entities)])
+    X_train, y_train = splits["train"]
+    X_test, y_test = splits["test"]
 
-    train_sequences = build_sequence_groups(train_df, entity_col)
-    test_sequences = build_sequence_groups(test_df, entity_col)
+    if len(X_train) == 0 or len(X_test) == 0:
+        raise ValueError(
+            f"Empty train or test split. "
+            f"train={len(X_train)}, test={len(X_test)}. "
+            f"Check split column {split_column!r} and split values."
+        )
 
-    cat_cols = list(categorical_features.keys())
-    num_cols = feat_cfg["numeric_columns"]
-
-    train_dataset = TransactionDataset(
-        train_sequences, cat_cols, num_cols, k_past=model_cfg["k_past"]
-    )
-    test_dataset = TransactionDataset(
-        test_sequences, cat_cols, num_cols, k_past=model_cfg["k_past"]
-    )
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=train_cfg["batch_size"], shuffle=False, collate_fn=collate_fn
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=train_cfg["batch_size"], shuffle=False, collate_fn=collate_fn
-    )
-
-    model = NPPRModel(
-        hidden_dim=model_cfg["hidden_dim"],
-        output_dim=model_cfg["output_dim"],
-        categorical_features=categorical_features,
-        num_numeric=len(num_cols),
-        feature_embed_dim=model_cfg["feature_embed_dim"],
-        pr_weight=model_cfg["pr_weight"],
-        decay_length=model_cfg["decay_length"],
-        gru_num_layers=model_cfg["gru_num_layers"],
-    ).to(device)
-
-    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-
-    pool = eval_cfg["embedding_pool"]
-    X_train, _ = extract_entity_embeddings(model, train_loader, device, pool)
-    X_test, _ = extract_entity_embeddings(model, test_loader, device, pool)
-
-    y_train = entity_labels_from_sequences(train_sequences, entity_col, label_column)
-    y_test = entity_labels_from_sequences(test_sequences, entity_col, label_column)
+    print(f"Loaded {len(df):,} rows from {parquet_path} ({level} level)")
+    print(f"Train: {len(X_train):,} rows | Test: {len(X_test):,} rows | Embed dim: {len(embed_cols)}")
 
     metrics = train_downstream_classifier(
-        X_train.numpy(),
-        y_train,
-        X_test.numpy(),
-        y_test,
+        X_train,
+        y_train.astype(int),
+        X_test,
+        y_test.astype(int),
         eval_cfg,
         device,
     )
 
-    print("Downstream evaluation (frozen NPPR embeddings):")
+    print("Downstream evaluation (frozen embeddings from parquet):")
     for name, value in metrics.items():
         print(f"  {name}: {value:.4f}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate NPPR embeddings on a downstream task")
+    parser = argparse.ArgumentParser(description="Evaluate frozen embeddings from parquet")
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument(
+        "--embeddings",
+        default=None,
+        help="Path to embeddings parquet (default: evaluation.embeddings_path in config)",
+    )
     args = parser.parse_args()
-    main(args.config, args.checkpoint)
+    main(args.config, args.embeddings)

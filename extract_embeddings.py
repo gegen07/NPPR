@@ -9,13 +9,13 @@ import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from checkpointing import build_model_from_checkpoint
 from dataset import TransactionDataset, build_sequence_groups, collate_fn_embed
-from evaluate import (
+from embedding_extraction import (
     entity_embeddings_to_dataframe,
     extract_entity_embeddings,
     extract_transaction_embeddings_to_dataframe,
 )
-from model import NPPRModel
 from preprocess import TransactionPreprocessor
 
 
@@ -32,19 +32,19 @@ def load_model_and_data(
     batch_size: int,
 ):
     data_cfg = config["data"]
-    feat_cfg = config["features"]
-    model_cfg = config["model"]
     train_cfg = config["training"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     checkpoint = Path(checkpoint_path or train_cfg["checkpoint_path"])
     if not checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 
-    data_path = Path(data_cfg["emb_path"])
+    model, _, model_cfg, feat_cfg = build_model_from_checkpoint(config, checkpoint, device)
+
+    data_path = Path(data_cfg.get("emb_path") or data_cfg["path"])
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset not found: {data_path}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     entity_col = data_cfg["entity_column"]
     transaction_id_col = data_cfg.get("transaction_id_column", "transaction.id")
     categorical_features = feat_cfg["categorical"]
@@ -95,21 +95,6 @@ def load_model_and_data(
         pin_memory=device.type == "cuda",
     )
 
-    model = NPPRModel(
-        hidden_dim=model_cfg["hidden_dim"],
-        output_dim=model_cfg["output_dim"],
-        categorical_features=categorical_features,
-        num_numeric=len(num_cols),
-        feature_embed_dim=model_cfg["feature_embed_dim"],
-        pr_weight=model_cfg["pr_weight"],
-        decay_length=model_cfg["decay_length"],
-        gru_num_layers=model_cfg["gru_num_layers"],
-    ).to(device)
-
-    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-
     return {
         "device": device,
         "checkpoint": checkpoint,
@@ -154,7 +139,6 @@ def main(
         batch_size=effective_batch_size,
     )
     device = ctx["device"]
-    checkpoint = ctx["checkpoint"]
     entity_col = ctx["entity_col"]
     transaction_id_col = ctx["transaction_id_col"]
     dataset = ctx["dataset"]

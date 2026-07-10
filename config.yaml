@@ -4,6 +4,7 @@ data:
   entity_column: customer.id
   transaction_id_column: transaction.id
   label_column: null  # set for downstream evaluation, e.g. churn
+  embeddings_path: embeddings/transaction_embeddings.parquet
 
 features:
   categorical:
@@ -29,7 +30,7 @@ features:
 
 model:
   hidden_dim: 512
-  output_dim: 512
+  output_dim: 64
   feature_embed_dim: 16
   pr_weight: 0.001      # alpha in the paper
   decay_length: 5184000 # 60 days in seconds (lambda = ~2 months)
@@ -51,7 +52,12 @@ training:
   checkpoint_path: checkpoints/best_model.pt
 
 evaluation:
-  downstream_hidden_dim: 512
+  embeddings_path: embeddings/transaction_embeddings.parquet
+  split_column: split
+  train_splits: [train, val]
+  test_splits: [test]
+  level: transaction  # transaction or entity
+  downstream_hidden_dim: 64
   downstream_num_layers: 3
   downstream_epochs: 20
   downstream_lr: 0.001
