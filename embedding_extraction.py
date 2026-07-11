@@ -68,6 +68,8 @@ def extract_transaction_embeddings_to_dataframe(
             )
             chunk_df.insert(0, entity_column, sample["customer_id"])
             chunk_df.insert(0, transaction_id_column, sample["transaction_ids"][:seq_len])
+            for col, values in sample.get("metadata", {}).items():
+                chunk_df[col] = values[:seq_len]
 
             table = pa.Table.from_pandas(chunk_df, preserve_index=False)
             if writer is None:

@@ -4,15 +4,14 @@ import random
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
-import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import TransactionDataset, build_sequence_groups, collate_fn
+from data_pipeline import load_dataframe, prepare_datasets
+from dataset import TransactionDataset, collate_fn
 from model import NPPRModel
-from preprocess import TransactionPreprocessor
+from nppr_config import load_config
 
 
 def set_seed(seed: int):
@@ -21,11 +20,6 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
 
 
 def move_batch_to_device(batch, device):
@@ -91,8 +85,9 @@ def run_epoch(model, dataloader, device, optimizer=None, grad_clip=0.5, use_amp=
     return total_loss / max(n_batches, 1)
 
 
-def main(config_path: str):
-    config = load_config(config_path)
+def main(config_path: str, dataset_name: str | None):
+    config = load_config(config_path, dataset_name=dataset_name)
+    tqdm.write(f"Dataset profile: {config['dataset_name']}")
 
     data_cfg = config["data"]
     feat_cfg = config["features"]
@@ -101,45 +96,22 @@ def main(config_path: str):
 
     set_seed(train_cfg["seed"])
 
-    data_path = Path(data_cfg["path"])
-    if not data_path.exists():
-        raise FileNotFoundError(f"Dataset not found: {data_path}")
-
-    df = pd.read_csv(data_path)
-    entity_col = data_cfg["entity_column"]
-    categorical_features = feat_cfg["categorical"]
-
-    preprocessor = TransactionPreprocessor(
-        categorical_features=categorical_features,
-        numeric_mappings=feat_cfg.get("numeric_mappings"),
-        time_gap_source=feat_cfg["time_gap_source"],
-        time_features_zero_indexed=feat_cfg.get("time_features_zero_indexed", []),
-        preprocessed=feat_cfg.get("preprocessed", False),
-    )
-
-    entity_ids = df[entity_col].unique()
-    rng = random.Random(train_cfg["seed"])
-    rng.shuffle(entity_ids)
-    split = int(len(entity_ids) * train_cfg["train_frac"])
-    train_entities = set(entity_ids[:split])
-
-    train_df = preprocessor.fit_transform(df[df[entity_col].isin(train_entities)])
-    val_df = preprocessor.transform(df[~df[entity_col].isin(train_entities)])
-
-    train_sequences = build_sequence_groups(train_df, entity_col)
-    val_sequences = build_sequence_groups(val_df, entity_col)
-
-    cat_cols = list(categorical_features.keys())
-    num_cols = feat_cfg["numeric_columns"]
-    k_past = model_cfg["k_past"]
+    df = load_dataframe(data_cfg)
+    prepared = prepare_datasets(df, data_cfg, feat_cfg, train_cfg, model_cfg["k_past"])
 
     train_dataset = TransactionDataset(
-        train_sequences, cat_cols, num_cols, k_past=k_past
+        prepared["train_sequences"],
+        prepared["cat_cols"],
+        prepared["num_cols"],
+        k_past=prepared["k_past"],
     )
     val_dataset = TransactionDataset(
-        val_sequences, cat_cols, num_cols, k_past=k_past
+        prepared["val_sequences"],
+        prepared["cat_cols"],
+        prepared["num_cols"],
+        k_past=prepared["k_past"],
     )
-    del df, train_df, val_df, train_sequences, val_sequences
+    del df, prepared
     gc.collect()
 
     train_loader = build_dataloader(
@@ -166,11 +138,13 @@ def main(config_path: str):
         tqdm.write(f"Using GPU: {torch.cuda.get_device_name(device)}")
     else:
         use_amp = False
+
+    categorical_features = feat_cfg["categorical"]
     model = NPPRModel(
         hidden_dim=model_cfg["hidden_dim"],
         output_dim=model_cfg["output_dim"],
         categorical_features=categorical_features,
-        num_numeric=len(num_cols),
+        num_numeric=len(feat_cfg["numeric_columns"]),
         feature_embed_dim=model_cfg["feature_embed_dim"],
         pr_weight=model_cfg["pr_weight"],
         decay_length=model_cfg["decay_length"],
@@ -218,6 +192,7 @@ def main(config_path: str):
                 {
                     "model_state_dict": model.state_dict(),
                     "config": config,
+                    "dataset_name": config["dataset_name"],
                     "val_loss": val_loss,
                     "epoch": epoch + 1,
                 },
@@ -236,5 +211,10 @@ def main(config_path: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pretrain NPPR model")
     parser.add_argument("--config", default="config.yaml", help="Path to config YAML")
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="Dataset profile name (default: active_dataset in config)",
+    )
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, args.dataset)

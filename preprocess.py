@@ -105,4 +105,6 @@ class TransactionPreprocessor:
     def _raw_time_gaps(df: pd.DataFrame) -> pd.Series:
         if "Time_Gap" in df.columns:
             return df["Time_Gap"].fillna(0).replace(0, 1e-6)
-        return df["timestamp_diff"].fillna(0).replace(0, 1e-6)
+        if "timestamp_diff" in df.columns:
+            return df["timestamp_diff"].fillna(0).replace(0, 1e-6)
+        raise ValueError("Time_Gap or timestamp_diff must be present before preprocessing.")

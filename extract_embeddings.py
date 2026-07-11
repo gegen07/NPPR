@@ -1,37 +1,26 @@
 import argparse
 import gc
-import random
 from pathlib import Path
 
-import pandas as pd
 import torch
-import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from checkpointing import build_model_from_checkpoint
-from dataset import TransactionDataset, build_sequence_groups, collate_fn_embed
+from data_pipeline import load_dataframe, prepare_all_sequences
+from dataset import TransactionDataset, collate_fn_embed
 from embedding_extraction import (
     entity_embeddings_to_dataframe,
     extract_entity_embeddings,
     extract_transaction_embeddings_to_dataframe,
 )
-from preprocess import TransactionPreprocessor
+from nppr_config import load_config
 
 
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
-def load_model_and_data(
-    config,
-    checkpoint_path: str | None,
-    *,
-    for_transactions: bool,
-    batch_size: int,
-):
+def load_model_and_data(config, checkpoint_path: str | None, *, for_transactions: bool, batch_size: int):
     data_cfg = config["data"]
+    feat_cfg = config["features"]
+    model_cfg = config["model"]
     train_cfg = config["training"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -41,49 +30,25 @@ def load_model_and_data(
 
     model, _, model_cfg, feat_cfg = build_model_from_checkpoint(config, checkpoint, device)
 
-    data_path = Path(data_cfg.get("emb_path") or data_cfg["path"])
-    if not data_path.exists():
-        raise FileNotFoundError(f"Dataset not found: {data_path}")
-
-    entity_col = data_cfg["entity_column"]
-    transaction_id_col = data_cfg.get("transaction_id_column", "transaction.id")
-    categorical_features = feat_cfg["categorical"]
-
-    df = pd.read_csv(data_path)
-    entity_ids_all = df[entity_col].unique()
-    rng = random.Random(train_cfg["seed"])
-    entity_ids_shuffled = list(entity_ids_all)
-    rng.shuffle(entity_ids_shuffled)
-    split = int(len(entity_ids_shuffled) * train_cfg["train_frac"])
-    train_entities = set(entity_ids_shuffled[:split])
-
-    preprocessor = TransactionPreprocessor(
-        categorical_features=categorical_features,
-        numeric_mappings=feat_cfg.get("numeric_mappings"),
-        time_gap_source=feat_cfg["time_gap_source"],
-        time_features_zero_indexed=feat_cfg.get("time_features_zero_indexed", []),
-        preprocessed=feat_cfg.get("preprocessed", False),
-    )
-    preprocessor.fit(df[df[entity_col].isin(train_entities)])
-    df = preprocessor.transform(df)
-
-    sequences = build_sequence_groups(df, entity_col)
+    df = load_dataframe(data_cfg)
+    prepared = prepare_all_sequences(df, data_cfg, feat_cfg, train_cfg, model_cfg["k_past"])
     del df
     gc.collect()
 
-    cat_cols = list(categorical_features.keys())
-    num_cols = feat_cfg["numeric_columns"]
+    transaction_id_col = data_cfg.get("transaction_id_column", "transaction.id")
+    entity_col = prepared["entity_col"]
 
     dataset = TransactionDataset(
-        sequences,
-        cat_cols,
-        num_cols,
-        k_past=model_cfg["k_past"],
+        prepared["sequences"],
+        prepared["cat_cols"],
+        prepared["num_cols"],
+        k_past=prepared["k_past"],
         transaction_id_column=transaction_id_col if for_transactions else None,
         entity_column=entity_col,
+        metadata_columns=data_cfg.get("metadata_columns"),
         include_delta=False,
     )
-    del sequences
+    del prepared["sequences"]
     gc.collect()
 
     loader = DataLoader(
@@ -110,19 +75,24 @@ def load_model_and_data(
 def main(
     config_path: str,
     checkpoint_path: str | None,
-    output_path: str,
+    output_path: str | None,
     level: str,
     pool: str | None,
     batch_size: int | None,
+    dataset_name: str | None,
 ):
-    config = load_config(config_path)
+    config = load_config(config_path, dataset_name=dataset_name)
+    print(f"Dataset profile: {config['dataset_name']}")
+
+    data_cfg = config["data"]
     eval_cfg = config["evaluation"]
     extract_cfg = config.get("extraction", {})
 
     if level not in ("transaction", "entity"):
         raise ValueError("level must be 'transaction' or 'entity'")
 
-    output = Path(output_path)
+    default_output = data_cfg.get("embeddings_path", "embeddings/transaction_embeddings.parquet")
+    output = Path(output_path or default_output)
     if level == "transaction":
         effective_batch_size = batch_size or extract_cfg.get("batch_size", 1)
         if output.suffix != ".parquet":
@@ -209,8 +179,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--output",
-        default="embeddings/transaction_embeddings.parquet",
-        help="Output parquet path",
+        default=None,
+        help="Output parquet path (default: dataset embeddings_path in config)",
     )
     parser.add_argument(
         "--level",
@@ -230,5 +200,18 @@ if __name__ == "__main__":
         default=None,
         help="Override batch size (default: 1 for transactions, 64 for entities)",
     )
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="Dataset profile name (default: active_dataset in config)",
+    )
     args = parser.parse_args()
-    main(args.config, args.checkpoint, args.output, args.level, args.pool, args.batch_size)
+    main(
+        args.config,
+        args.checkpoint,
+        args.output,
+        args.level,
+        args.pool,
+        args.batch_size,
+        args.dataset,
+    )

@@ -5,14 +5,11 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import yaml
 from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 
-
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
+from nppr_config import load_config
 
 
 class DownstreamMLP(nn.Module):
@@ -112,13 +109,25 @@ def train_downstream_classifier(X_train, y_train, X_test, y_test, eval_cfg, devi
     criterion = nn.CrossEntropyLoss()
 
     clf.train()
-    for _ in range(eval_cfg["downstream_epochs"]):
+    epoch_bar = tqdm(range(eval_cfg["downstream_epochs"]), desc="Training head", unit="epoch")
+    for epoch in epoch_bar:
+        epoch_loss = 0.0
+        n_batches = 0
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
             loss = criterion(clf(xb), yb)
             loss.backward()
             optimizer.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        epoch_bar.set_postfix(
+            epoch=epoch + 1,
+            avg_loss=f"{epoch_loss / max(n_batches, 1):.4f}",
+            refresh=False,
+        )
 
     clf.eval()
     with torch.no_grad():
@@ -134,8 +143,9 @@ def train_downstream_classifier(X_train, y_train, X_test, y_test, eval_cfg, devi
     return metrics
 
 
-def main(config_path: str, embeddings_path: str | None):
-    config = load_config(config_path)
+def main(config_path: str, embeddings_path: str | None, dataset_name: str | None):
+    config = load_config(config_path, dataset_name=dataset_name)
+    print(f"Dataset profile: {config['dataset_name']}")
     data_cfg = config["data"]
     eval_cfg = config["evaluation"]
 
@@ -212,7 +222,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--embeddings",
         default=None,
-        help="Path to embeddings parquet (default: evaluation.embeddings_path in config)",
+        help="Path to embeddings parquet (default: dataset embeddings_path in config)",
+    )
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="Dataset profile name (default: active_dataset in config)",
     )
     args = parser.parse_args()
-    main(args.config, args.embeddings)
+    main(args.config, args.embeddings, args.dataset)

@@ -27,6 +27,7 @@ def _sequence_to_arrays(
     time_gap_column,
     transaction_id_column=None,
     entity_column=None,
+    metadata_columns=None,
 ):
     """Store each customer sequence as compact numpy arrays (no torch duplication)."""
     sample = {
@@ -44,6 +45,12 @@ def _sequence_to_arrays(
         )
     if entity_column and entity_column in seq.columns:
         sample["customer_id"] = seq[entity_column].iloc[0]
+    if metadata_columns:
+        sample["metadata"] = {
+            col: seq[col].to_numpy()
+            for col in metadata_columns
+            if col in seq.columns
+        }
     return sample
 
 
@@ -57,6 +64,7 @@ class TransactionDataset(Dataset):
         k_past: int = 10,
         transaction_id_column: str | None = None,
         entity_column: str | None = None,
+        metadata_columns: list[str] | None = None,
         include_delta: bool = True,
     ):
         self.categorical_columns = categorical_columns
@@ -70,6 +78,7 @@ class TransactionDataset(Dataset):
                 time_gap_column,
                 transaction_id_column=transaction_id_column,
                 entity_column=entity_column,
+                metadata_columns=metadata_columns,
             )
             for seq in sequences
         ]

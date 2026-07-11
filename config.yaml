@@ -1,39 +1,85 @@
-data:
-  path: data/clients.csv
-  emb_path: data/emb.csv
-  entity_column: customer.id
-  transaction_id_column: transaction.id
-  label_column: null  # set for downstream evaluation, e.g. churn
-  embeddings_path: embeddings/transaction_embeddings.parquet
+active_dataset: merchants
 
-features:
-  categorical:
-    oh_f_Payment_type: 7
-    oh_f_Payment_currency: 11
-    oh_f_Received_currency: 12
-    oh_f_Sender_bank_location: 14
-    oh_f_Receiver_bank_location: 17
-    t_f_datetime_month: 12
-    t_f_datetime_day: 31
-    t_f_datetime_hour: 24
-    t_f_datetime_minute: 60
-    t_f_weekday: 7
-  numeric_columns:
-    - c_f_Amount
-    - c_f_timestamp_diff
-    - oh_f_same_currency
-    - oh_f_same_location
-  numeric_mappings: {}
-  time_gap_source: timestamp_diff
-  time_features_zero_indexed: []
-  preprocessed: true
+datasets:
+  samld:
+    data:
+      path: data/clients.csv
+      entity_column: customer.id
+      transaction_id_column: transaction.id
+      datetime_column: timestamp
+      label_column: null
+      use_split_column: false
+    features:
+      categorical:
+        oh_f_Payment_type: 7
+        oh_f_Payment_currency: 11
+        oh_f_Received_currency: 12
+        oh_f_Sender_bank_location: 14
+        oh_f_Receiver_bank_location: 17
+        t_f_datetime_month: 12
+        t_f_datetime_day: 31
+        t_f_datetime_hour: 24
+        t_f_datetime_minute: 60
+        t_f_weekday: 7
+      numeric_columns:
+        - c_f_Amount
+        - c_f_timestamp_diff
+        - oh_f_same_currency
+        - oh_f_same_location
+      numeric_mappings: {}
+      time_gap_source: timestamp_diff
+      time_features_zero_indexed: []
+      preprocessed: true
+    outputs:
+      checkpoint_path: checkpoints/clients_best_model.pt
+      embeddings_path: embeddings/clients_transaction_embeddings.parquet
+
+  sparkov:
+    data:
+      path: data/merchants.csv
+      entity_column: customer.id
+      transaction_id_column: transaction.id
+      datetime_column: datetime
+      label_column: label
+      use_split_column: true
+      split_column: split
+      train_splits: [train]
+      val_splits: [val]
+      test_splits: [test]
+      metadata_columns: [label, split, group_index]
+    features:
+      categorical:
+        oh_f_category: 154     
+        oh_f_state: 47  
+        t_f_datetime_month: 12
+        t_f_datetime_day: 31
+        t_f_datetime_hour: 24
+        t_f_datetime_minute: 60
+        t_f_weekday: 7
+      numeric_columns:
+        - q_f_amt_quantile
+        - q_f_timestamp_diff_quantile
+        - q_f_long_quantile
+        - q_f_lat_quantile
+        - q_f_merch_lat_quantile
+        - q_f_merch_long_quantile
+      numeric_mappings: {}
+      time_gap_source: datetime
+      time_features_zero_indexed: []
+      preprocessed: true
+    outputs:
+      checkpoint_path: checkpoints/merchants_best_model.pt
+      embeddings_path: embeddings/merchants_transaction_embeddings.parquet
+    evaluation:
+      train_splits: [train, val]
+      test_splits: [test]
 
 model:
   hidden_dim: 512
   output_dim: 64
   feature_embed_dim: 16
-  pr_weight: 0.001      # alpha in the paper
-  decay_length: 5184000 # 60 days in seconds (lambda = ~2 months)
+  pr_weight: 0.001
+  decay_length: 5184000
   gru_num_layers: 1
   k_past: 10
 
@@ -52,11 +98,10 @@ training:
   checkpoint_path: checkpoints/best_model.pt
 
 evaluation:
-  embeddings_path: embeddings/transaction_embeddings.parquet
   split_column: split
   train_splits: [train, val]
   test_splits: [test]
-  level: transaction  # transaction or entity
+  level: transaction
   downstream_hidden_dim: 64
   downstream_num_layers: 3
   downstream_epochs: 20
@@ -64,5 +109,5 @@ evaluation:
   embedding_pool: mean
 
 extraction:
-  batch_size: 1          # one customer per batch avoids padding blow-up on GPU
+  batch_size: 1
   entity_batch_size: 64

@@ -13,7 +13,11 @@ def resolve_model_and_features(config: dict, checkpoint: dict) -> tuple[dict, di
     """Use architecture from the checkpoint so weights load correctly."""
     saved = checkpoint.get("config")
     if saved:
-        return saved["model"], saved["features"]
+        if "features" in saved:
+            return saved["model"], saved["features"]
+        if "datasets" in saved and "dataset_name" in saved:
+            profile = saved["datasets"][saved["dataset_name"]]
+            return saved["model"], profile["features"]
     return config["model"], config["features"]
 
 
